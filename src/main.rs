@@ -2,107 +2,157 @@
 extern crate crossbeam_channel;
 extern crate rayon;
 
-use crossbeam_channel::unbounded;
-use std::collections::HashMap;
+use crossbeam_channel::{tick, unbounded};
+use std::collections::{HashMap, VecDeque};
 use std::thread;
+use std::time::Duration;
 
 fn main() {}
 
 #[test]
-fn test_streaming_workflow() {
-    enum WorkMsg {
+fn first() {
+    /// The messages sent from the "source",
+    /// to the "proccessor".
+    enum SourceMsg {
+        /// Work to be processed.
         Work(u8),
-        Exit,
+        /// The source has defenitively stopped producing.
+        Stopped,
     }
 
-    enum ResultMsg {
+    /// The messages sent from the "processor",
+    /// to the "consumer"(effectively the main thread of the test).
+    enum ProcessorMsg {
         Result(u8),
-        Exited,
+        /// The processor has defenitively stopped processing.
+        Stopped,
     }
 
     let (work_sender, work_receiver) = unbounded();
     let (result_sender, result_receiver) = unbounded();
-    // Add a new channel, used by workers
-    // to notity the "parallel" component of having completed a unit of work.
-    let (pool_result_sender, pool_result_receiver) = unbounded();
-    let mut ongoing_work = 0;
-    let mut exiting = false;
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(2)
-        .build()
-        .unwrap();
 
-    let _ = thread::spawn(move || loop {
-        select! {
-            recv(work_receiver) -> msg => {
-                match msg {
-                    Ok(WorkMsg::Work(num)) => {
-                        let result_sender = result_sender.clone();
-                        let pool_result_sender = pool_result_sender.clone();
+    // Keeping a clone alive just to prevent a receive error after the source stops.
+    let _work_sender_clone = work_sender.clone();
 
-                        // Note that we're starting a new unit of work on the pool.
-                        ongoing_work += 1;
+    // Spawn a "processor" component in parallel.
+    let _ = thread::spawn(move || {
+        // The processor has two worker threads at it's disposal.
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
 
-                        pool.spawn(move || {
-                            // 1. Send the result to the main component.
-                            let _ = result_sender.send(ResultMsg::Result(num));
+        // Workers in the pool communicate that they've finished a unit of work,
+        // back to the main-thread of the "processor", via this channel.
+        let (pool_result_sender, pool_result_receiver) = unbounded();
 
-                            // 2. Let the parallel component know we've completed a unit of work.
-                            let _ = pool_result_sender.send(());
-                        });
-                    },
-                    Ok(WorkMsg::Exit) => {
-                        // Note that we've received the request to exit.
-                        exiting = true;
+        // A counter of ongoing work performed on the pool.
+        let mut ongoing_work = 0;
 
-                        // If there is no ongoing work,
-                        // we can immediately exit.
-                        if ongoing_work == 0 {
-                            let _ = result_sender.send(ResultMsg::Exited);
-                            break;
+        // A flag to keep track of whether the source has already stopped producing.
+        let mut exiting = false;
+
+        loop {
+            // Receive, and handle, messages,
+            // until told to exit.
+            select! {
+                recv(work_receiver) -> msg => {
+                    match msg {
+                        Ok(SourceMsg::Work(num)) => {
+                            // Surprisingly, the length of the channel doesn't really go up.
+                            // Where's the work piling-up?
+                            println!("Queue: {:?}", work_receiver.len());
+
+                            // Clone the channels to move them into the worker.
+                            let result_sender = result_sender.clone();
+                            let pool_result_sender = pool_result_sender.clone();
+
+                            ongoing_work +=1;
+
+                            pool.spawn(move || {
+                                // Perform some "work", sending the result to the "consumer".
+                                thread::sleep(Duration::from_millis(3));
+                                let _ = result_sender.send(ProcessorMsg::Result(num));
+                                let _ = pool_result_sender.send(());
+                            });
+                        },
+                        Ok(SourceMsg::Stopped) => {
+                            // Note that we've received the request to exit.
+                            exiting = true;
+
+                            // If there is no ongoing work,
+                            // we can immediately exit.
+                            if ongoing_work == 0 {
+                                let _ = result_sender.send(ProcessorMsg::Stopped);
+                                break;
+                            }
                         }
-                    },
-                    _ => panic!("Error receiving a WorkMsg."),
-                }
-            },
-            recv(pool_result_receiver) -> _ => {
-                if ongoing_work == 0 {
-                    panic!("Received an unexpected pool result.");
-                }
+                        _ => {
+                            // Note: will not happen thanks to `_work_sender_clone`.
+                            panic!("Error receiving a SourceMsg.");
+                        },
+                    }
+                },
+                recv(pool_result_receiver) -> _ => {
+                    if ongoing_work == 0 {
+                        panic!("Received an unexpected pool result.");
+                    }
 
-                // Note that a unit of work has been completed.
-                ongoing_work -=1;
+                    // Note that a unit of work has been completed.
+                    ongoing_work -=1;
 
-                // If there is no more ongoing work,
-                // and we've received the request to exit,
-                // now is the time to exit.
-                if ongoing_work == 0 && exiting {
-                    let _ = result_sender.send(ResultMsg::Exited);
-                    break;
-                }
-            },
+                    // If there is no more ongoing work,
+                    // and we've received the request to exit,
+                    // now is the time to exit.
+                    if ongoing_work == 0 && exiting {
+                        let _ = result_sender.send(ProcessorMsg::Stopped);
+                        break;
+                    }
+                },
+            }
         }
     });
 
-    let _ = work_sender.send(WorkMsg::Work(0));
-    let _ = work_sender.send(WorkMsg::Work(1));
-    let _ = work_sender.send(WorkMsg::Exit);
+    // Spawn a "source" component in parallel.
+    let _ = thread::spawn(move || {
+        // A counter of work produced.
+        let mut counter: u8 = 0;
+        let ticker = tick(Duration::from_millis(1));
+        loop {
+            // Block on a tick.
+            ticker.recv().unwrap();
 
+            match counter.checked_add(1) {
+                Some(new_counter) => {
+                    // Produce, and send for processing, a piece of "work".
+                    let _ = work_sender.send(SourceMsg::Work(counter));
+                    counter = new_counter
+                }
+                None => {
+                    // Stop producing once we overflow.
+                    let _ = work_sender.send(SourceMsg::Stopped);
+                    break;
+                }
+            }
+        }
+    });
+
+    // The main test thread, doubling as the "consumer" component.
+
+    // A counter of work received.
     let mut counter = 0;
 
     loop {
         match result_receiver.recv() {
-            Ok(ResultMsg::Result(_)) => {
-                // Count the units of work that have been completed.
+            Ok(ProcessorMsg::Result(num)) => {
                 counter += 1;
             }
-            Ok(ResultMsg::Exited) => {
-                // Assert that we're exiting after having received
-                // all results.
-                assert_eq!(2, counter);
+            Ok(ProcessorMsg::Stopped) => {
+                // Processor has stopped.
+                assert_eq!(counter, u8::MAX);
                 break;
             }
-            _ => panic!("Error receiving a ResultMsg."),
+            _ => panic!("Error receiving a ProcessorMsg."),
         }
     }
 }
